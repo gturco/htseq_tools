@@ -1,10 +1,60 @@
 import sys, optparse, itertools, warnings, traceback, os.path
-
+from collections import defaultdict
 import HTSeq
 
 class UnknownChrom( Exception ):
    pass
-   
+
+def collapse_gene(genes):
+    """collapse all genes in an array"""
+    colgenes = {}
+    for key in genes:
+        loci = genes[key]
+        s = min([start for start,end in loci])
+        e = max([end for start,end in loci])
+        colgenes[key] = (s,e)
+    return colgenes
+
+
+def parse_gff(gff_filename,features,feature_type,id_attribute,stranded,quiet,counts):
+    gff = HTSeq.GFF_Reader( gff_filename )
+    genes = defaultdict(list)
+    i = 0
+    try:
+        for f in gff:
+            if f.type == feature_type:
+                try:
+                    feature_id = f.attr[ id_attribute ]
+                except KeyError:
+                    sys.exit( "Feature %s does not contain a '%s' attribute" % 
+                            ( f.name, id_attribute ) )
+                if stranded != "no" and f.iv.strand == ".":
+                    sys.exit( "Feature %s at %s does not have strand information but you are "
+                    "running htseq-count in stranded mode. Use '--stranded=no'." % 
+                    ( f.name, f.iv ) )
+                genes[f.name].append((f.iv.start,f.iv.end))
+                features[ f.iv ] += feature_id
+                counts[ f.attr[ id_attribute ] ] = 0
+            i += 1
+            if i % 100000 == 0 and not quiet:
+                sys.stderr.write( "%d GFF lines processed.\n" % i )
+        colgenes = collapse_gene(genes)
+    except:
+        sys.stderr.write( "Error occured in %s.\n" % gff.get_line_number_string() )
+        raise
+    
+    if not quiet:
+        sys.stderr.write( "%d GFF lines processed.\n" % i )
+    
+    return counts, colgenes
+
+
+def get_rpkm(maped_reads,total_reads,pos):
+    """RPKM=(number of mapping reads)*1000bp*1 million reads/[(length of transcript)*(number of total reads )"""
+    transcript_len = pos[1] - pos[0]
+    rpkm = maped_reads * 10000000000/transcript_len/float(total_reads)
+    return rpkm, maped_reads
+
 def invert_strand( iv ):
    iv2 = iv.copy()
    if iv2.strand == "+":
@@ -38,53 +88,30 @@ def count_reads_in_features( sam_filename, gff_filename, stranded,
       
    features = HTSeq.GenomicArrayOfSets( "auto", stranded != "no" )     
    counts = {}
+   gene_length = {}
 
    # Try to open samfile to fail early in case it is not there
    if sam_filename != "-":
       open( sam_filename ).close()
-      
-   gff = HTSeq.GFF_Reader( gff_filename )   
-   i = 0
-   try:
-      for f in gff:
-         if f.type == feature_type:
-            try:
-               feature_id = f.attr[ id_attribute ]
-            except KeyError:
-               sys.exit( "Feature %s does not contain a '%s' attribute" % 
-                  ( f.name, id_attribute ) )
-            if stranded != "no" and f.iv.strand == ".":
-               sys.exit( "Feature %s at %s does not have strand information but you are "
-                  "running htseq-count in stranded mode. Use '--stranded=no'." % 
-                  ( f.name, f.iv ) )
-            features[ f.iv ] += feature_id
-            counts[ f.attr[ id_attribute ] ] = 0
-         i += 1
-         if i % 100000 == 0 and not quiet:
-            sys.stderr.write( "%d GFF lines processed.\n" % i )
-   except:
-      sys.stderr.write( "Error occured in %s.\n" % gff.get_line_number_string() )
-      raise
-      
-   if not quiet:
-      sys.stderr.write( "%d GFF lines processed.\n" % i )
+ 
+   counts, colgenes = parse_gff(gff_filename,features,feature_type,id_attribute,stranded,quiet,counts)
       
    if len( counts ) == 0 and not quiet:
       sys.stderr.write( "Warning: No features of type '%s' found.\n" % feature_type )
-   
+   ################# read sam file #######################
    try:
       if sam_filename != "-":
-         read_seq = HTSeq.SAM_Reader( sam_filename )
-         first_read = iter(read_seq).next()
+          read_seq = HTSeq.SAM_Reader( sam_filename )
+          first_read = iter(read_seq).next()
       else:
-         read_seq = iter( HTSeq.SAM_Reader( sys.stdin ) )
-         first_read = read_seq.next()
-         read_seq = itertools.chain( [ first_read ], read_seq )
+          read_seq = iter( HTSeq.SAM_Reader( sys.stdin ) )
+          first_read = read_seq.next()
+          read_seq = itertools.chain( [ first_read ], read_seq )
       pe_mode = first_read.paired_end
    except:
       sys.stderr.write( "Error occured when reading first line of sam file.\n" )
       raise
-
+   ################ read sam file #######################
    try:
       if pe_mode:
          read_seq_pe_file = read_seq
@@ -157,6 +184,7 @@ def count_reads_in_features( sam_filename, gff_filename, stranded,
                   if iv.chrom not in features.chrom_vectors:
                      raise UnknownChrom
                   for iv2, fs2 in features[ iv ].steps():
+                     ## what is within the genomic interval of iv
                      fs = fs.union( fs2 )
             elif overlap_mode == "intersection-strict" or overlap_mode == "intersection-nonempty":
                fs = None
@@ -180,6 +208,7 @@ def count_reads_in_features( sam_filename, gff_filename, stranded,
             else:
                write_to_samout( r, list(fs)[0] )
                counts[ list(fs)[0] ] += 1
+         
          except UnknownChrom:
             if not pe_mode:
                rr = r 
@@ -208,7 +237,9 @@ def count_reads_in_features( sam_filename, gff_filename, stranded,
       samoutfile.close()
 
    for fn in sorted( counts.keys() ):
-      print "%s\t%d" % ( fn, counts[fn] )
+      print i, sum(counts.values())
+      rpkm, feature_len = get_rpkm(counts[fn],i,colgenes[fn])
+      print "%s\t%d\t%d\t%d" % ( fn, counts[fn], feature_len,rpkm)
    print "no_feature\t%d" % empty
    print "ambiguous\t%d" % ambiguous
    print "too_low_aQual\t%d" % lowqual
